@@ -149,6 +149,7 @@ public class FancyNpcsModelPlugin extends JavaPlugin {
         FancyNpcsPlugin.get().getAttributeManager().registerAttribute(CustomModelAttribute.getModelAttribute());
         FancyNpcsPlugin.get().getActionManager().registerAction(new PlayAnimationOnceAction());
         FancyNpcsPlugin.get().getActionManager().registerAction(new PlayAnimationLoopAction());
+        CustomModelAttribute.registerTrackerCreationListener(this);
 
         metrics.register();
         metrics.checkIfPluginVersionUpdated();

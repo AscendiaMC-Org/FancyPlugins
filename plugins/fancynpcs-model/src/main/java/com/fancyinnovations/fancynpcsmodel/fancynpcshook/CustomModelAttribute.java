@@ -9,7 +9,9 @@ import de.oliver.fancynpcs.api.Npc;
 import de.oliver.fancynpcs.api.NpcAttribute;
 import de.oliver.fancynpcs.api.actions.ActionTrigger;
 import kr.toxicity.model.api.BetterModel;
+import kr.toxicity.model.api.bukkit.BetterModelBukkit;
 import kr.toxicity.model.api.bukkit.platform.BukkitAdapter;
+import kr.toxicity.model.api.event.CreateEntityTrackerEvent;
 import kr.toxicity.model.api.event.hitbox.HitBoxDamagedEvent;
 import kr.toxicity.model.api.event.hitbox.HitBoxInteractAtEvent;
 import kr.toxicity.model.api.platform.PlatformEntity;
@@ -23,6 +25,7 @@ import org.bukkit.entity.Player;
 import org.bukkit.event.player.PlayerResourcePackStatusEvent;
 
 import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
@@ -74,9 +77,20 @@ public class CustomModelAttribute {
      * queue (see {@link #spawnForPlayer} for why ordering matters here).
      */
     public static void onNpcSpawn(Npc npc, Player player) {
-        PENDING_SPAWN_TARGETS
-                .computeIfAbsent(npc.getData().getId(), key -> ConcurrentHashMap.newKeySet())
-                .add(player.getUniqueId());
+        // Must add the player inside the atomic compute() call, not via a separate
+        // computeIfAbsent().add() (the previous approach): computeIfAbsent() only makes the
+        // *lookup/insert* atomic, the .add() on the returned Set happens as a second, unguarded
+        // step. setModelOnEntityThread's drain (PENDING_SPAWN_TARGETS.remove(id)) can run in
+        // between those two steps on another thread, taking the set away right before .add()
+        // lands on it - the player is then added to an orphaned Set no longer reachable from the
+        // map, and is never spawned for. compute() performs the read-and-mutate as one atomic,
+        // per-key operation, so it can never interleave with a concurrent remove() on that key -
+        // this is what caused a model to occasionally never reappear for a returning player.
+        PENDING_SPAWN_TARGETS.compute(npc.getData().getId(), (key, existing) -> {
+            Set<UUID> targets = existing != null ? existing : ConcurrentHashMap.newKeySet();
+            targets.add(player.getUniqueId());
+            return targets;
+        });
     }
 
     public static NpcAttribute getModelAttribute() {
@@ -192,6 +206,103 @@ public class CustomModelAttribute {
             return;
         }
 
+        // Usually already done by the CreateEntityTrackerEvent subscription (see
+        // #registerTrackerCreationListener), which fires synchronously inside getOrCreate() above,
+        // before this line even runs. Guarded here too in case that ever isn't true, so this NPC's
+        // tracker is never left without hitbox listeners.
+        if (!CONFIGURED_TRACKERS.contains(tracker)) {
+            configureTracker(npc, tracker);
+        }
+
+        // The model itself just changed (or was created), so every currently online player needs
+        // the new spawn packets - not just whoever's visibility triggered this call. Any player(s)
+        // NpcSpawnListener had queued up are covered by this broadcast too, so drop them.
+        PENDING_SPAWN_TARGETS.remove(npc.getData().getId());
+
+        EntityTrackerRegistry registry = tracker.registry();
+        int dispatched = 0;
+        for (Player player : Bukkit.getOnlinePlayers()) {
+            if (isResourcePackPending(player.getUniqueId())) continue;
+            spawnForPlayer(registry, player);
+            dispatched++;
+        }
+        FancyNpcsModelPlugin.get().getFancyLogger().debug(
+                "setModel npc=" + npcName + " model=" + modelName + " created new tracker, dispatched spawn to " + dispatched + " player(s)"
+                        + " onlinePlayers=" + Bukkit.getOnlinePlayers().size()
+        );
+    }
+
+    /**
+     * Subscribes to BetterModel's own {@code CreateEntityTrackerEvent} so this NPC's hitbox
+     * listeners get (re)attached no matter who created the tracker.
+     * <p>
+     * Previously, hitbox listeners were only attached inline, right after <em>this plugin's own</em>
+     * {@code getOrCreate()} call in {@link #setModelOnEntityThread}. But BetterModel can also
+     * create a fresh {@code EntityTracker} for the same entity entirely on its own (e.g. on
+     * {@code /bettermodel reload}, or internal recovery/recreation) - a path this plugin never
+     * gets a callback for, since {@link #setModel(Npc, String)} only runs when FancyNpcs
+     * re-applies attributes. When that happened, the new tracker rendered the model fine (that's
+     * driven by BetterModel itself) but had no hitbox listeners at all, so every model NPC would
+     * stop responding to interaction at once until an admin ran {@code /bettermodel reload} -
+     * which is exactly what this subscription now does automatically, for every NPC, every time.
+     */
+    public static void registerTrackerCreationListener(FancyNpcsModelPlugin plugin) {
+        BetterModelBukkit.platform().eventBus().subscribe(plugin, CreateEntityTrackerEvent.class, event -> {
+            // This runs synchronously *inside* BetterModel's own EntityTracker constructor (see
+            // that class - the event is fired as the very last constructor statement), which in
+            // turn can run synchronously inside our own getOrCreate() call in
+            // setModelOnEntityThread. Never let anything here throw: an uncaught exception would
+            // propagate out of that constructor and abort getOrCreate() for whoever's waiting on
+            // it - including our own setModel(), which would then never reach its "broadcast the
+            // new tracker to every online player" step below. That looked exactly like "some NPCs
+            // never get a model at all" when it happened.
+            try {
+                EntityTracker tracker = event.tracker();
+                if (CONFIGURED_TRACKERS.contains(tracker)) {
+                    return;
+                }
+
+                Npc npc = findNpcForTracker(tracker);
+                if (npc == null) {
+                    return;
+                }
+
+                configureTracker(npc, tracker);
+            } catch (Throwable t) {
+                FancyNpcsModelPlugin.get().getFancyLogger().error(
+                        "Failed to configure a newly created BetterModel tracker",
+                        ThrowableProperty.of(t)
+                );
+            }
+        });
+    }
+
+    /**
+     * Finds the FancyNpcs NPC (with the model attribute) whose entity backs the given tracker, or
+     * null if it doesn't belong to one - e.g. the server uses BetterModel for something other than
+     * this plugin's NPCs.
+     */
+    private static Npc findNpcForTracker(EntityTracker tracker) {
+        UUID entityUuid = tracker.sourceEntity().uuid();
+        for (Npc npc : FancyNpcsPlugin.get().getNpcManager().getAllNpcs()) {
+            if (!hasAttribute(npc)) continue;
+
+            Entity bukkitEntity = getBukkitEntity(npc);
+            if (bukkitEntity != null && bukkitEntity.getUniqueId().equals(entityUuid)) {
+                return npc;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * One-time setup for a freshly created tracker: registers it as configured (idempotency guard
+     * used by {@link #setModelOnEntityThread}), applies the NPC's scale, and wires up hitbox
+     * click listeners. Called from exactly one of two places for any given tracker - whichever
+     * gets there first, see {@link #registerTrackerCreationListener} - never both, so listeners
+     * are never registered twice on the same tracker (which would double-fire interactions).
+     */
+    private static void configureTracker(Npc npc, EntityTracker tracker) {
         CONFIGURED_TRACKERS.add(tracker);
         tracker.handleCloseEvent((closedTracker, reason) -> CONFIGURED_TRACKERS.remove(closedTracker));
 
@@ -217,23 +328,6 @@ public class CustomModelAttribute {
 
             npc.interact(player, ActionTrigger.LEFT_CLICK);
         });
-
-        // The model itself just changed (or was created), so every currently online player needs
-        // the new spawn packets - not just whoever's visibility triggered this call. Any player(s)
-        // NpcSpawnListener had queued up are covered by this broadcast too, so drop them.
-        PENDING_SPAWN_TARGETS.remove(npc.getData().getId());
-
-        EntityTrackerRegistry registry = tracker.registry();
-        int dispatched = 0;
-        for (Player player : Bukkit.getOnlinePlayers()) {
-            if (isResourcePackPending(player.getUniqueId())) continue;
-            spawnForPlayer(registry, player);
-            dispatched++;
-        }
-        FancyNpcsModelPlugin.get().getFancyLogger().debug(
-                "setModel npc=" + npcName + " model=" + modelName + " created new tracker, dispatched spawn to " + dispatched + " player(s)"
-                        + " onlinePlayers=" + Bukkit.getOnlinePlayers().size()
-        );
     }
 
     /**
@@ -325,8 +419,17 @@ public class CustomModelAttribute {
         }
 
         // call the Entity#getBukkitEntity method to get the bukkit entity object
+        Method getBukkitEntityMethod = ReflectionUtils.getMethod(nmsEntity, "getBukkitEntity");
+        if (getBukkitEntityMethod == null) {
+            FancyNpcsModelPlugin.get().getFancyLogger().error(
+                    "Failed to find getBukkitEntity method on NMS entity",
+                    StringProperty.of("npc_name", npc.getData().getName())
+            );
+            return null;
+        }
+
         try {
-            return (Entity) ReflectionUtils.getMethod(nmsEntity, "getBukkitEntity").invoke(nmsEntity);
+            return (Entity) getBukkitEntityMethod.invoke(nmsEntity);
         } catch (IllegalAccessException | InvocationTargetException e) {
             FancyNpcsModelPlugin.get().getFancyLogger().error(
                     "Failed to invoke getBukkitEntity method on NMS entity",
