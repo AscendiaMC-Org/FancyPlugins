@@ -56,6 +56,29 @@ public class CustomModelAttribute {
      */
     private static final Map<UUID, Integer> LOADING_RESOURCE_PACKS = new ConcurrentHashMap<>();
 
+    /**
+     * Players a model spawn is owed to, keyed by {@link de.oliver.fancynpcs.api.NpcData#getId()}.
+     * Fed by {@link #onNpcSpawn(Npc, Player)}, which listens to FancyNpcs' per-player
+     * {@code NpcSpawnEvent} - the only place that actually knows which single player triggered
+     * the attribute re-apply that follows (see {@link #setModelOnEntityThread}). Drained (and
+     * cleared) the next time that NPC's attribute setter runs, so only the player(s) who just
+     * (re)gained visibility get resent the model, instead of every online player.
+     */
+    private static final Map<String, Set<UUID>> PENDING_SPAWN_TARGETS = new ConcurrentHashMap<>();
+
+    /**
+     * Called from {@code NpcSpawnEvent} (fired once per player, at the point FancyNpcs is about
+     * to (re)send that player their view of the NPC). Only records the player - the actual
+     * spawn-packet dispatch happens later from {@link #setModelOnEntityThread}, on FancyNpcs'
+     * own npc-thread, so it lands after the NPC's own add-entity bundle in that player's packet
+     * queue (see {@link #spawnForPlayer} for why ordering matters here).
+     */
+    public static void onNpcSpawn(Npc npc, Player player) {
+        PENDING_SPAWN_TARGETS
+                .computeIfAbsent(npc.getData().getId(), key -> ConcurrentHashMap.newKeySet())
+                .add(player.getUniqueId());
+    }
+
     public static NpcAttribute getModelAttribute() {
         return new NpcAttribute(
                 ATTRIBUTE_NAME,
@@ -111,24 +134,34 @@ public class CustomModelAttribute {
                         + " onlinePlayers=" + Bukkit.getOnlinePlayers().size()
         );
         if (alreadyConfigured) {
-            // Still (re)spawn it for every online player, same as the unconditional spawn() used
-            // below on first creation - NOT spawnIfNotSpawned(). Server-side "isSpawned" state
-            // can be true even when the player's client never actually rendered it (e.g. the
-            // player's world/chunks were still loading - common with async-loaded island worlds -
-            // when the first spawn packets went out), so trusting it would permanently skip
-            // resending to a player who silently never got the model. Unlike the destructive
-            // close+recreate this used to do on every call, resending spawn packets for the same,
-            // already-existing tracker/entity ids is cheap and side-effect-free for players who
-            // did already receive them.
+            // This setter has no idea which single player's visibility check triggered this call
+            // (FancyNpcs' NpcAttribute only passes (Npc, value), see class javadoc on
+            // PENDING_SPAWN_TARGETS) - so instead of guessing, only (re)spawn for whichever
+            // player(s) NpcSpawnListener recorded via onNpcSpawn() since the last drain. That is
+            // exactly the player(s) currently (re)gaining visibility of this NPC; everyone else
+            // already has the model and resending to them would just make their client rebuild it
+            // (visible flicker/"reload") for no reason.
+            //
+            // Still an unconditional spawn(), NOT spawnIfNotSpawned() - server-side "isSpawned"
+            // state can be true even when the player's client never actually rendered it (e.g.
+            // the player's world/chunks were still loading when the first spawn packets went
+            // out), so trusting it would permanently skip resending to a player who silently
+            // never got the model.
+            Set<UUID> targets = PENDING_SPAWN_TARGETS.remove(npc.getData().getId());
+            if (targets == null || targets.isEmpty()) {
+                return;
+            }
+
             EntityTrackerRegistry registry = currentTracker.registry();
             int dispatched = 0;
-            for (Player player : Bukkit.getOnlinePlayers()) {
-                if (isResourcePackPending(player.getUniqueId())) continue;
+            for (UUID uuid : targets) {
+                Player player = Bukkit.getPlayer(uuid);
+                if (player == null || isResourcePackPending(uuid)) continue;
                 spawnForPlayer(registry, player);
                 dispatched++;
             }
             FancyNpcsModelPlugin.get().getFancyLogger().debug(
-                    "setModel npc=" + npcName + " already configured, dispatched spawn to " + dispatched + " player(s)"
+                    "setModel npc=" + npcName + " already configured, dispatched spawn to " + dispatched + "/" + targets.size() + " pending target(s)"
             );
             return;
         }
@@ -184,6 +217,11 @@ public class CustomModelAttribute {
 
             npc.interact(player, ActionTrigger.LEFT_CLICK);
         });
+
+        // The model itself just changed (or was created), so every currently online player needs
+        // the new spawn packets - not just whoever's visibility triggered this call. Any player(s)
+        // NpcSpawnListener had queued up are covered by this broadcast too, so drop them.
+        PENDING_SPAWN_TARGETS.remove(npc.getData().getId());
 
         EntityTrackerRegistry registry = tracker.registry();
         int dispatched = 0;
@@ -245,6 +283,13 @@ public class CustomModelAttribute {
 
     public static void clearResourcePackState(UUID playerUuid) {
         LOADING_RESOURCE_PACKS.remove(playerUuid);
+
+        // Drop any spawn this player was still owed - they're gone, and leaving the UUID behind
+        // would just sit in PENDING_SPAWN_TARGETS forever (nothing else ever removes single
+        // entries from it, only whole-NPC drains).
+        for (Set<UUID> targets : PENDING_SPAWN_TARGETS.values()) {
+            targets.remove(playerUuid);
+        }
     }
 
     /**

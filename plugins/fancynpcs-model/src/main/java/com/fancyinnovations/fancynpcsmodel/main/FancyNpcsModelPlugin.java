@@ -10,6 +10,7 @@ import com.fancyinnovations.fancynpcsmodel.fancynpcshook.PlayAnimationLoopAction
 import com.fancyinnovations.fancynpcsmodel.fancynpcshook.PlayAnimationOnceAction;
 import com.fancyinnovations.fancynpcsmodel.listeners.NpcInteractListener;
 import com.fancyinnovations.fancynpcsmodel.listeners.NpcRemoveListener;
+import com.fancyinnovations.fancynpcsmodel.listeners.NpcSpawnListener;
 import com.fancyinnovations.fancynpcsmodel.listeners.ResourcePackListener;
 import com.fancyinnovations.fancynpcsmodel.metrics.FNMMetrics;
 import de.oliver.fancyanalytics.logger.ExtendedFancyLogger;
@@ -181,6 +182,7 @@ public class FancyNpcsModelPlugin extends JavaPlugin {
     private void registerListeners() {
         Bukkit.getPluginManager().registerEvents(new NpcInteractListener(), this);
         Bukkit.getPluginManager().registerEvents(new NpcRemoveListener(), this);
+        Bukkit.getPluginManager().registerEvents(new NpcSpawnListener(), this);
         Bukkit.getPluginManager().registerEvents(new ResourcePackListener(), this);
     }
 
