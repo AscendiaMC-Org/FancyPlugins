@@ -9,6 +9,7 @@ import de.oliver.fancynpcs.api.Npc;
 import de.oliver.fancynpcs.api.NpcAttribute;
 import de.oliver.fancynpcs.api.actions.ActionTrigger;
 import kr.toxicity.model.api.BetterModel;
+import kr.toxicity.model.api.bone.BoneTags;
 import kr.toxicity.model.api.bukkit.BetterModelBukkit;
 import kr.toxicity.model.api.bukkit.platform.BukkitAdapter;
 import kr.toxicity.model.api.event.CreateEntityTrackerEvent;
@@ -17,6 +18,7 @@ import kr.toxicity.model.api.event.hitbox.HitBoxInteractAtEvent;
 import kr.toxicity.model.api.platform.PlatformEntity;
 import kr.toxicity.model.api.tracker.EntityTracker;
 import kr.toxicity.model.api.tracker.EntityTrackerRegistry;
+import kr.toxicity.model.api.util.function.BonePredicate;
 import net.kyori.adventure.text.Component;
 import org.bukkit.Bukkit;
 import org.bukkit.entity.Entity;
@@ -69,6 +71,14 @@ public class CustomModelAttribute {
      * (re)gained visibility get resent the model, instead of every online player.
      */
     private static final Map<String, Set<UUID>> PENDING_SPAWN_TARGETS = new ConcurrentHashMap<>();
+
+    /**
+     * Last time (epoch millis) this plugin attempted to recreate a missing/broken tracker for an
+     * NPC, keyed by {@link de.oliver.fancynpcs.api.NpcData#getId()}. Used by {@link #ensureTracker}
+     * to rate-limit retries - see that method's javadoc for why this exists at all.
+     */
+    private static final Map<String, Long> LAST_TRACKER_RECREATE_ATTEMPT = new ConcurrentHashMap<>();
+    private static final long TRACKER_RECREATE_INTERVAL_MS = TimeUnit.SECONDS.toMillis(5);
 
     /**
      * Called from {@code NpcSpawnEvent} (fired once per player, at the point FancyNpcs is about
@@ -265,6 +275,17 @@ public class CustomModelAttribute {
 
                 Npc npc = findNpcForTracker(tracker);
                 if (npc == null) {
+                    // Silently returning here used to be indistinguishable from "not one of our
+                    // NPCs" (the common, expected case - BetterModel is also used for non-NPC
+                    // entities). Logged at warn, not debug: if this ever fires for a tracker that
+                    // *does* belong to one of our NPCs (e.g. a transient lookup failure under
+                    // server-start load), the tracker is left with no hitbox listeners and nothing
+                    // else will log anything - this is the only place that could ever surface it.
+                    FancyNpcsModelPlugin.get().getFancyLogger().debug(
+                            "registerTrackerCreationListener: no matching NPC found for tracker sourceEntity="
+                                    + tracker.sourceEntity().uuid() + " model=" + tracker.name()
+                                    + " - leaving unconfigured for setModelOnEntityThread's own fallback/self-heal to retry"
+                    );
                     return;
                 }
 
@@ -297,16 +318,25 @@ public class CustomModelAttribute {
     }
 
     /**
-     * One-time setup for a freshly created tracker: registers it as configured (idempotency guard
-     * used by {@link #setModelOnEntityThread}), applies the NPC's scale, and wires up hitbox
-     * click listeners. Called from exactly one of two places for any given tracker - whichever
-     * gets there first, see {@link #registerTrackerCreationListener} - never both, so listeners
-     * are never registered twice on the same tracker (which would double-fire interactions).
+     * One-time setup for a freshly created tracker: applies the NPC's scale, wires up hitbox click
+     * listeners, and - only once that has fully succeeded - registers it as configured (idempotency
+     * guard used by {@link #setModelOnEntityThread} and by the self-heal in
+     * {@link #reconcileVisibility}/{@link #forceResyncForPlayer}/{@link #ensureTracker}). Called
+     * from exactly one of two places for any given tracker - whichever gets there first, see
+     * {@link #registerTrackerCreationListener} - never both, so listeners are never registered
+     * twice on the same tracker (which would double-fire interactions).
+     * <p>
+     * Marking the tracker configured is deliberately the LAST step, not the first: this runs during
+     * the exact join/server-start burst that {@link #forceResyncForPlayer}'s javadoc already
+     * documents as capable of silently dropping work, and a tracker that throws partway through
+     * setup (leaving some hitbox listeners unregistered) but still ends up in
+     * {@link #CONFIGURED_TRACKERS} would look "done" forever - no self-heal ever revisits a tracker
+     * once it's in that set, so the NPC would stay unclickable until an admin closed/reopened its
+     * tracker some other way (e.g. {@code /bettermodel reload}). With this ordering, a failed
+     * attempt leaves the tracker unconfigured, so the very next self-heal pass (within seconds,
+     * see {@link #ensureTracker}) closes it and tries again from scratch.
      */
     private static void configureTracker(Npc npc, EntityTracker tracker) {
-        CONFIGURED_TRACKERS.add(tracker);
-        tracker.handleCloseEvent((closedTracker, reason) -> CONFIGURED_TRACKERS.remove(closedTracker));
-
         // Scale
         if (npc.getData().getScale() != 1) {
             tracker.scaler(tracker.scaler().multiply(npc.getData().getScale()));
@@ -329,6 +359,52 @@ public class CustomModelAttribute {
 
             npc.interact(player, ActionTrigger.LEFT_CLICK);
         });
+
+        // BetterModel also creates this hitbox itself, automatically, shortly after tracker
+        // construction - but via a task scheduled through the *entity's own* location
+        // (EntityTracker's constructor -> entity.platform().task(...)), at the exact moment the
+        // tracker gets built. For these NPCs specifically, that first-ever tracker construction
+        // happens right at server start (see the "onlinePlayers=0" debug line above) - before any
+        // player is anywhere near the NPC's world/region. On Folia, a region with nobody in it
+        // yet is not necessarily "active", and BetterModel's one-shot scheduling attempt for it can
+        // silently never run - nothing ever retries it, so the hitbox (and therefore every click)
+        // is missing forever, even though the model itself renders fine once a player later joins
+        // (that's triggered separately, per-player, well after join - see spawnForPlayer). Manually
+        // running /bettermodel reload "fixes" this only because it rebuilds the tracker at a point
+        // where a player is already online and the region is definitely active.
+        //
+        // Force it explicitly here instead, dispatched the same way every other NPC-related
+        // operation in this class is (Bukkit.getRegionScheduler() keyed off the NPC's own
+        // configured location, not the entity's live one - see setModel's javadoc for why that
+        // distinction matters for these fake, never-added-to-the-world entities). This runs
+        // regardless of whether BetterModel's own attempt already succeeded or ever will - bones
+        // that already have a hitbox are left alone (see BetterModel's own HITBOX_REFRESH_PREDICATE
+        // pattern), so this is safe to always run, not just as a fallback.
+        //
+        // BetterModel's own convention (bone named exactly "hitbox", or tagged with its "b_"/"ob_"
+        // prefix) is tried first, matching what BetterModel itself would have created. Its third,
+        // internal-only condition (mount/seat bones) isn't reachable from addon code, so as a
+        // guaranteed catch-all - the model author may use neither convention, or use a name/tag
+        // this addon can't replicate exactly - fall back to a hitbox covering every bone whenever
+        // the named/tagged attempt matches nothing. A model NPC that ends up with a hitbox on every
+        // bone instead of one precisely placed one is still fully clickable, which is what matters
+        // here; it is not visually different since these hitboxes aren't rendered.
+        boolean createdNamedHitbox = tracker.createHitBox(null, BonePredicate.name("hitbox").or(BonePredicate.tag(BoneTags.HITBOX)).notSet());
+        int hitboxCountAfterNamed = tracker.registry().hitBoxes().size();
+        boolean createdFallbackHitbox = false;
+        if (hitboxCountAfterNamed == 0) {
+            createdFallbackHitbox = tracker.createHitBox(null, BonePredicate.TRUE);
+        }
+
+        CONFIGURED_TRACKERS.add(tracker);
+        tracker.handleCloseEvent((closedTracker, reason) -> CONFIGURED_TRACKERS.remove(closedTracker));
+
+        FancyNpcsModelPlugin.get().getFancyLogger().debug(
+                "configureTracker completed for npc=" + npc.getData().getName() + " model=" + tracker.name()
+                        + " createdNamedHitbox=" + createdNamedHitbox + " hitboxCountAfterNamed=" + hitboxCountAfterNamed
+                        + " createdFallbackHitbox=" + createdFallbackHitbox
+                        + " finalHitboxCount=" + tracker.registry().hitBoxes().size()
+        );
     }
 
     /**
@@ -432,6 +508,10 @@ public class CustomModelAttribute {
                     try {
                         EntityTracker tracker = getEntityTracker(npc);
                         if (tracker == null || tracker.isClosed() || !CONFIGURED_TRACKERS.contains(tracker)) {
+                            Entity bukkitEntity = getBukkitEntity(npc);
+                            if (bukkitEntity != null) {
+                                ensureTracker(npc, npc.getData().getName(), bukkitEntity);
+                            }
                             return;
                         }
 
@@ -496,6 +576,10 @@ public class CustomModelAttribute {
                         try {
                             EntityTracker tracker = getEntityTracker(npc);
                             if (tracker == null || tracker.isClosed() || !CONFIGURED_TRACKERS.contains(tracker)) {
+                                Entity bukkitEntity = getBukkitEntity(npc);
+                                if (bukkitEntity != null) {
+                                    ensureTracker(npc, npc.getData().getName(), bukkitEntity);
+                                }
                                 return;
                             }
 
@@ -621,6 +705,8 @@ public class CustomModelAttribute {
      * {@link #setModel(Npc, String)} does.
      */
     public static void closeAllTrackers(Npc npc) {
+        LAST_TRACKER_RECREATE_ATTEMPT.remove(npc.getData().getId());
+
         Entity bukkitEntity = getBukkitEntity(npc);
         if (bukkitEntity == null) {
             return;
@@ -636,6 +722,29 @@ public class CustomModelAttribute {
                 tracker.close();
             }
         });
+    }
+
+    /**
+     * Whether the given NPC currently has at least one clickable BetterModel hitbox. Used by
+     * {@link com.fancyinnovations.fancynpcsmodel.listeners.NpcInteractListener} to decide whether
+     * it's safe to cancel FancyNpcs' own base click.
+     * <p>
+     * BetterModel only ever creates a {@code HitBox} for bones that opt in - named exactly
+     * {@code hitbox}, tagged with {@code BoneTags.HITBOX} (i.e. a {@code b_}/{@code ob_} name
+     * prefix), or seat/mount bones (see {@code EntityTracker#CREATE_HITBOX_PREDICATE} in
+     * BetterModel's own source). A {@code .bbmodel} with none of those bones gets a tracker (the
+     * model renders fine) but never gets a single {@code HitBox} - so {@link #configureTracker}'s
+     * {@code listenHitBox} calls have nothing to ever fire, silently, with no error anywhere. Also
+     * covers the (much shorter-lived) window right after tracker creation, before BetterModel's own
+     * async initial {@code createHitBox} call has run yet.
+     */
+    public static boolean hasActiveHitbox(Npc npc) {
+        EntityTracker tracker = getEntityTracker(npc);
+        if (tracker == null || tracker.isClosed() || !CONFIGURED_TRACKERS.contains(tracker)) {
+            return false;
+        }
+
+        return !tracker.registry().hitBoxes().isEmpty();
     }
 
     /**
@@ -664,5 +773,51 @@ public class CustomModelAttribute {
         if (trackers.isEmpty()) return null;
 
         return trackers.iterator().next();
+    }
+
+    /**
+     * Self-heal for an NPC whose tracker is missing entirely (never created, closed with nothing
+     * rebuilding it, or created but never configured with hitbox listeners). Called from
+     * {@link #reconcileVisibility} and {@link #forceResyncForPlayer} when they find no usable
+     * tracker to sync - previously they just returned in that case, which is correct if the
+     * tracker merely hasn't been created *yet* on this call (e.g. mid-spawn), but permanently
+     * strands any NPC whose very first tracker creation attempt failed outright (e.g.
+     * {@link #getBukkitEntity} transiently returning null under the load of a server-start join
+     * burst, or the {@code CreateEntityTrackerEvent} subscription throwing before attaching
+     * listeners). Nothing else ever retries creation - not the periodic reconcile, not a world
+     * change, not a reconnect - so without this an affected NPC's model/hitbox stayed gone for
+     * good until an admin ran {@code /bettermodel reload}, and since {@link
+     * com.fancyinnovations.fancynpcsmodel.listeners.NpcInteractListener} unconditionally cancels
+     * the base click for any NPC with this attribute, that also meant the NPC was permanently
+     * unclickable.
+     * <p>
+     * Re-drives the exact same creation path {@link #setModel} itself uses, rate-limited per NPC
+     * so a genuinely misconfigured model (bad model name) doesn't retry - and error-log - every
+     * second forever.
+     */
+    private static void ensureTracker(Npc npc, String npcName, Entity bukkitEntity) {
+        String id = npc.getData().getId();
+        long now = System.currentTimeMillis();
+        Long last = LAST_TRACKER_RECREATE_ATTEMPT.get(id);
+        if (last != null && now - last < TRACKER_RECREATE_INTERVAL_MS) {
+            return;
+        }
+        LAST_TRACKER_RECREATE_ATTEMPT.put(id, now);
+
+        String modelName = getConfiguredModelName(npc);
+        if (modelName == null) {
+            return;
+        }
+
+        setModelOnEntityThread(npc, npcName, modelName, bukkitEntity);
+    }
+
+    private static String getConfiguredModelName(Npc npc) {
+        for (Map.Entry<NpcAttribute, String> entry : npc.getData().getAttributes().entrySet()) {
+            if (entry.getKey().getName().equalsIgnoreCase(ATTRIBUTE_NAME)) {
+                return entry.getValue();
+            }
+        }
+        return null;
     }
 }
