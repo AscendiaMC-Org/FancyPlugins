@@ -11,10 +11,12 @@ import com.fancyinnovations.fancynpcsmodel.fancynpcshook.PlayAnimationOnceAction
 import com.fancyinnovations.fancynpcsmodel.listeners.NpcInteractListener;
 import com.fancyinnovations.fancynpcsmodel.listeners.NpcRemoveListener;
 import com.fancyinnovations.fancynpcsmodel.listeners.NpcSpawnListener;
+import com.fancyinnovations.fancynpcsmodel.listeners.PlayerJoinListener;
 import com.fancyinnovations.fancynpcsmodel.listeners.ResourcePackListener;
 import com.fancyinnovations.fancynpcsmodel.metrics.FNMMetrics;
 import de.oliver.fancyanalytics.logger.ExtendedFancyLogger;
 import de.oliver.fancyanalytics.logger.LogLevel;
+import de.oliver.fancyanalytics.logger.properties.ThrowableProperty;
 import de.oliver.fancyanalytics.logger.appender.Appender;
 import de.oliver.fancyanalytics.logger.appender.ConsoleAppender;
 import de.oliver.fancyanalytics.logger.appender.JsonAppender;
@@ -151,6 +153,19 @@ public class FancyNpcsModelPlugin extends JavaPlugin {
         FancyNpcsPlugin.get().getActionManager().registerAction(new PlayAnimationLoopAction());
         CustomModelAttribute.registerTrackerCreationListener(this);
 
+        // Self-heals model visibility independently of any Bukkit event - see
+        // CustomModelAttribute#reconcileVisibility for why this is needed on Folia/CanvasMC.
+        // Wrapped defensively: an uncaught exception here would silently stop this repeating async
+        // task from ever firing again (see reconcileVisibility's own javadoc), permanently killing
+        // the self-heal for every NPC, not just the one that caused it.
+        Bukkit.getAsyncScheduler().runAtFixedRate(this, (_) -> {
+            try {
+                CustomModelAttribute.reconcileVisibility();
+            } catch (Throwable t) {
+                fancyLogger.error("Failed to run model visibility reconciliation", ThrowableProperty.of(t));
+            }
+        }, 1L, 1L, TimeUnit.SECONDS);
+
         metrics.register();
         metrics.checkIfPluginVersionUpdated();
 
@@ -185,6 +200,7 @@ public class FancyNpcsModelPlugin extends JavaPlugin {
         Bukkit.getPluginManager().registerEvents(new NpcRemoveListener(), this);
         Bukkit.getPluginManager().registerEvents(new NpcSpawnListener(), this);
         Bukkit.getPluginManager().registerEvents(new ResourcePackListener(), this);
+        Bukkit.getPluginManager().registerEvents(new PlayerJoinListener(), this);
     }
 
     public void registerTranslator() {

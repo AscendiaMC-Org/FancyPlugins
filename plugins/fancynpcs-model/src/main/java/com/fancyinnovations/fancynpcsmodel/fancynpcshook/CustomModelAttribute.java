@@ -33,6 +33,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 
 public class CustomModelAttribute {
 
@@ -171,7 +172,7 @@ public class CustomModelAttribute {
             for (UUID uuid : targets) {
                 Player player = Bukkit.getPlayer(uuid);
                 if (player == null || isResourcePackPending(uuid)) continue;
-                spawnForPlayer(registry, player);
+                spawnForPlayer(registry, npc, player);
                 dispatched++;
             }
             FancyNpcsModelPlugin.get().getFancyLogger().debug(
@@ -223,7 +224,7 @@ public class CustomModelAttribute {
         int dispatched = 0;
         for (Player player : Bukkit.getOnlinePlayers()) {
             if (isResourcePackPending(player.getUniqueId())) continue;
-            spawnForPlayer(registry, player);
+            spawnForPlayer(registry, npc, player);
             dispatched++;
         }
         FancyNpcsModelPlugin.get().getFancyLogger().debug(
@@ -347,8 +348,173 @@ public class CustomModelAttribute {
      * threads with no ordering between them at all - which is why only nearby NPCs used to get
      * their model, and repeating the attempt later didn't reliably help either.
      */
-    private static void spawnForPlayer(EntityTrackerRegistry registry, Player player) {
-        player.getScheduler().run(FancyNpcsModelPlugin.get(), task -> registry.spawn(BukkitAdapter.adapt(player)), null);
+    private static void spawnForPlayer(EntityTrackerRegistry registry, Npc npc, Player player) {
+        player.getScheduler().run(FancyNpcsModelPlugin.get(), task -> {
+            // Logged unconditionally (not just at debug level) because a false return here, with no
+            // exception and no other symptom, is exactly what a silently-dropped/never-rendered
+            // model looks like from the server's side - see forceResyncForPlayer's javadoc. Without
+            // this there is no way to tell "BetterModel declined to send anything" apart from "sent
+            // fine, client just didn't render it" after the fact.
+            if (!registry.spawn(BukkitAdapter.adapt(player))) {
+                FancyNpcsModelPlugin.get().getFancyLogger().warn(
+                        "registry.spawn() declined for npc " + npc.getData().getName() + " and player " + player.getName()
+                                + " - BetterModel sent nothing (no tracker matched, or player not yet known to BetterModel)"
+                );
+            }
+        }, null);
+    }
+
+    /**
+     * Counterpart to {@link #spawnForPlayer}: tells BetterModel a player is no longer viewing an
+     * NPC's model. Dispatched through the same per-player scheduler for the same reason
+     * spawnForPlayer is - see its javadoc.
+     */
+    private static void despawnForPlayer(EntityTrackerRegistry registry, Player player) {
+        player.getScheduler().run(FancyNpcsModelPlugin.get(), task -> registry.remove(BukkitAdapter.adapt(player)), null);
+    }
+
+    /**
+     * Brings one NPC's model in sync with FancyNpcs' own visibility for one player: spawns it if
+     * it should be shown and isn't (or, with {@code force}, even if BetterModel's own bookkeeping
+     * already believes it's shown - see {@link #forceResyncForPlayer}), and despawns it if it
+     * shouldn't be shown but still is.
+     */
+    private static void syncModelForPlayer(EntityTrackerRegistry registry, Npc npc, Player player, boolean force) {
+        boolean shouldBeShown = npc.isShownFor(player);
+        boolean isShown = registry.isSpawned(BukkitAdapter.adapt(player));
+
+        if (shouldBeShown) {
+            if ((force || !isShown) && !isResourcePackPending(player.getUniqueId())) {
+                spawnForPlayer(registry, npc, player);
+            }
+        } else if (isShown) {
+            despawnForPlayer(registry, player);
+        }
+    }
+
+    /**
+     * Periodic safety net that reconciles every model NPC's per-player BetterModel visibility
+     * with FancyNpcs' own per-player visibility state ({@link Npc#isShownFor(Player)}), in both
+     * directions - spawning the model for anyone who should see it but doesn't, and despawning it
+     * for anyone who shouldn't see it anymore but still does.
+     * <p>
+     * This exists because these NPCs are packet-only fake entities that are never added to the
+     * world (see {@link #getBukkitEntity}'s javadoc), so BetterModel's own automatic per-chunk
+     * viewer tracking ({@code Entity#trackedBy()}) never sees them - nothing keeps a model's
+     * visibility in sync with the base NPC's on its own, in either direction. The event-driven
+     * path ({@code NpcSpawnListener} + {@link #setModelOnEntityThread}) handles the common case,
+     * but only runs off FancyNpcs' own {@code NpcSpawnEvent}, which is fired from inside
+     * {@code Npc#spawn(Player)} - itself normally triggered by Bukkit's
+     * {@code PlayerChangedWorldEvent}/{@code PlayerTeleportEvent}. Both of those are known to not
+     * reliably fire on Folia - and CanvasMC, a Folia fork, inherits the same gap by design (kept
+     * for upstream Folia compatibility, see https://docs.canvasmc.io/canvas/info/folia/fixes/).
+     * When that happens, the base NPC still (re)appears/disappears correctly, because FancyNpcs
+     * separately self-heals visibility from its own periodic {@code VisibilityTracker}, which
+     * doesn't depend on any Bukkit event - but nothing on this plugin's side ever re-ran, so the
+     * model can be left permanently out of sync with it (most commonly: missing right after a
+     * world change, or still shown server-side to a player who is no longer near/in the same
+     * world as the NPC). Running this on its own timer, independent of any Bukkit event, closes
+     * that gap the same way FancyNpcs' own tracker closes it for the base NPC.
+     */
+    public static void reconcileVisibility() {
+        for (Npc npc : FancyNpcsPlugin.get().getNpcManager().getAllNpcs()) {
+            // This runs unattended on a timer, forever - a single bad NPC (no location, mid-removal,
+            // whatever) throwing here must never be allowed to propagate: Bukkit.getAsyncScheduler()
+            // is backed by a plain fixed-rate scheduler, and those silently stop rescheduling a task
+            // for good after its first uncaught exception. That would look exactly like "some NPCs
+            // never get their model back" - permanently, for the rest of the server's uptime, not
+            // just a one-off skip - so every NPC gets its own try/catch instead of one around the
+            // whole loop.
+            try {
+                if (!hasAttribute(npc) || npc.getData().getLocation() == null) continue;
+
+                Bukkit.getRegionScheduler().run(FancyNpcsModelPlugin.get(), npc.getData().getLocation(), task -> {
+                    try {
+                        EntityTracker tracker = getEntityTracker(npc);
+                        if (tracker == null || tracker.isClosed() || !CONFIGURED_TRACKERS.contains(tracker)) {
+                            return;
+                        }
+
+                        EntityTrackerRegistry registry = tracker.registry();
+                        for (Player player : Bukkit.getOnlinePlayers()) {
+                            syncModelForPlayer(registry, npc, player, false);
+                        }
+                    } catch (Throwable t) {
+                        FancyNpcsModelPlugin.get().getFancyLogger().error(
+                                "Failed to reconcile model visibility for npc " + npc.getData().getName(),
+                                ThrowableProperty.of(t)
+                        );
+                    }
+                });
+            } catch (Throwable t) {
+                FancyNpcsModelPlugin.get().getFancyLogger().error(
+                        "Failed to schedule model visibility reconciliation for npc " + npc.getData().getName(),
+                        ThrowableProperty.of(t)
+                );
+            }
+        }
+    }
+
+    /**
+     * One-shot, unconditional model resend for a single player - unlike {@link #reconcileVisibility},
+     * this ignores {@code registry.isSpawned(player)} and resends regardless.
+     * <p>
+     * Needed for a join-time race this plugin's own debug logs confirmed: on a fresh join, every
+     * visible NPC has its model attribute applied within the same second (one
+     * {@code checkAndUpdateVisibility} pass per NPC), which for any NPC nobody has looked at yet
+     * this server run means creating its {@code EntityTracker} for the first time - the "create new
+     * tracker" branch in {@link #setModelOnEntityThread}. With a dozen-plus NPCs clustered at a
+     * spawn hub all doing that within the same tick, some of their spawn dispatches land fine and
+     * some don't: {@code registry.spawn()} still returns normally and marks the player as spawned in
+     * BetterModel's own bookkeeping, but the model never actually renders client-side for a subset
+     * of them (same root cause the existing "unconditional spawn(), NOT spawnIfNotSpawned()" comment
+     * on {@link #spawnForPlayer}'s caller already describes: server-side "isSpawned" can be true
+     * even when the client never rendered it). Because the server-side state already says "spawned",
+     * {@link #reconcileVisibility}'s isShown check can't detect or fix this - it needs an
+     * unconditional resend instead. A world change fixes it by accident, because it forces every NPC
+     * (and its model) through a full remove+respawn one at a time, well outside that initial burst;
+     * this does the equivalent for a fresh join.
+     * <p>
+     * Staggered ~150ms apart per NPC instead of firing all of them in the same instant: doing that
+     * would just reproduce the exact same "many mount packets for the same player in one tick"
+     * pattern the join burst already causes trouble with (confirmed live: an earlier version of this
+     * method fired every NPC in the same tick and the exact same class of failure still occurred, on
+     * a different pair of NPCs each time - clearly a volume/timing issue, not one tied to any
+     * specific NPC).
+     */
+    public static void forceResyncForPlayer(Player player) {
+        int index = 0;
+        for (Npc npc : FancyNpcsPlugin.get().getNpcManager().getAllNpcs()) {
+            if (!hasAttribute(npc) || npc.getData().getLocation() == null) continue;
+
+            long delayMs = 150L * index++;
+            Bukkit.getAsyncScheduler().runDelayed(FancyNpcsModelPlugin.get(), (delayedTask) -> {
+                try {
+                    if (!player.isOnline()) return;
+
+                    Bukkit.getRegionScheduler().run(FancyNpcsModelPlugin.get(), npc.getData().getLocation(), task -> {
+                        try {
+                            EntityTracker tracker = getEntityTracker(npc);
+                            if (tracker == null || tracker.isClosed() || !CONFIGURED_TRACKERS.contains(tracker)) {
+                                return;
+                            }
+
+                            syncModelForPlayer(tracker.registry(), npc, player, true);
+                        } catch (Throwable t) {
+                            FancyNpcsModelPlugin.get().getFancyLogger().error(
+                                    "Failed to force-resync model for npc " + npc.getData().getName() + " and player " + player.getName(),
+                                    ThrowableProperty.of(t)
+                            );
+                        }
+                    });
+                } catch (Throwable t) {
+                    FancyNpcsModelPlugin.get().getFancyLogger().error(
+                            "Failed to schedule forced model resync for npc " + npc.getData().getName(),
+                            ThrowableProperty.of(t)
+                    );
+                }
+            }, Math.max(delayMs, 1L), TimeUnit.MILLISECONDS);
+        }
     }
 
     private static boolean isResourcePackPending(UUID playerUuid) {
@@ -404,7 +570,13 @@ public class CustomModelAttribute {
                 EntityTracker tracker = getEntityTracker(npc);
                 if (tracker == null || tracker.isClosed()) return;
 
-                spawnForPlayer(tracker.registry(), player);
+                // The player's pack was still loading when this NPC last checked visibility, so it
+                // may have moved on (e.g. changed world again) before the pack finished - only
+                // catch it up on NPCs FancyNpcs actually still considers visible to them, otherwise
+                // this would spawn a model with no base NPC behind it for the player to see.
+                if (!npc.isShownFor(player)) return;
+
+                spawnForPlayer(tracker.registry(), npc, player);
             });
         }
     }
