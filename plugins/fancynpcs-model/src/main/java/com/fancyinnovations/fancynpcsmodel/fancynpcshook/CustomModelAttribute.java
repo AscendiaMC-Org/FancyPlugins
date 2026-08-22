@@ -21,6 +21,8 @@ import kr.toxicity.model.api.tracker.EntityTrackerRegistry;
 import kr.toxicity.model.api.util.function.BonePredicate;
 import net.kyori.adventure.text.Component;
 import org.bukkit.Bukkit;
+import org.bukkit.Location;
+import org.bukkit.World;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.EntityType;
 import org.bukkit.entity.Player;
@@ -79,6 +81,17 @@ public class CustomModelAttribute {
      */
     private static final Map<String, Long> LAST_TRACKER_RECREATE_ATTEMPT = new ConcurrentHashMap<>();
     private static final long TRACKER_RECREATE_INTERVAL_MS = TimeUnit.SECONDS.toMillis(5);
+
+    /**
+     * The chunk this plugin is currently keeping force-loaded for each NPC (keyed by
+     * {@link de.oliver.fancynpcs.api.NpcData#getId()}), via {@link #ensureChunkTicket}. See that
+     * method's javadoc for why a model NPC's chunk must stay loaded for as long as it has a
+     * tracker.
+     */
+    private static final Map<String, ChunkTicket> CHUNK_TICKETS = new ConcurrentHashMap<>();
+
+    private record ChunkTicket(String world, int chunkX, int chunkZ) {
+    }
 
     /**
      * Called from {@code NpcSpawnEvent} (fired once per player, at the point FancyNpcs is about
@@ -289,7 +302,35 @@ public class CustomModelAttribute {
                     return;
                 }
 
-                configureTracker(npc, tracker);
+                // Usually this fires synchronously inside our own getOrCreate() call in
+                // setModelOnEntityThread, which is already dispatched onto the correct Folia region
+                // thread for the npc's location (see that method's javadoc) - configureTracker's
+                // createHitBox() call, which adds a real NMS entity to the world, is then safe to
+                // run inline, right here.
+                //
+                // But BetterModel can also (re)create trackers entirely on its own, completely
+                // outside that call stack - most notably /bettermodel reload, which rebuilds every
+                // tracker from a plain async scheduler thread with no region ownership at all.
+                // Calling createHitBox() directly from there throws Folia's AsyncCatcher
+                // ("Asynchronous entity add!"), the hitbox never gets created, and nothing else
+                // ever retries it - every model NPC stays unclickable until a player-triggered
+                // (and therefore correctly-dispatched) tracker rebuild happens to occur. Detect
+                // that case and hop onto the NPC's owning region thread first, same as every other
+                // NMS-touching operation in this class.
+                Location location = npc.getData().getLocation();
+                if (location == null) {
+                    FancyNpcsModelPlugin.get().getFancyLogger().debug(
+                            "registerTrackerCreationListener: npc " + npc.getData().getName()
+                                    + " has no location, cannot verify/dispatch to its region thread - leaving unconfigured"
+                    );
+                    return;
+                }
+                if (Bukkit.isOwnedByCurrentRegion(location)) {
+                    configureTracker(npc, tracker);
+                } else {
+                    Bukkit.getRegionScheduler().run(FancyNpcsModelPlugin.get(), location,
+                            task -> configureTracker(npc, tracker));
+                }
             } catch (Throwable t) {
                 FancyNpcsModelPlugin.get().getFancyLogger().error(
                         "Failed to configure a newly created BetterModel tracker",
@@ -337,6 +378,10 @@ public class CustomModelAttribute {
      * see {@link #ensureTracker}) closes it and tries again from scratch.
      */
     private static void configureTracker(Npc npc, EntityTracker tracker) {
+        // Keep this NPC's chunk force-loaded for as long as it has a tracker - see
+        // #ensureChunkTicket's javadoc for why the hitbox is otherwise not reliably clickable.
+        ensureChunkTicket(npc);
+
         // Scale
         if (npc.getData().getScale() != 1) {
             tracker.scaler(tracker.scaler().multiply(npc.getData().getScale()));
@@ -508,6 +553,25 @@ public class CustomModelAttribute {
                     try {
                         EntityTracker tracker = getEntityTracker(npc);
                         if (tracker == null || tracker.isClosed() || !CONFIGURED_TRACKERS.contains(tracker)) {
+                            // Only (re)create a tracker if some online player should actually be
+                            // seeing this NPC right now. Confirmed live, twice: creating one for an
+                            // NPC nobody is near - including at server start, with zero players
+                            // online at all, which this loop would otherwise hit on its very first
+                            // tick - produces a hitbox that is never properly wired up for
+                            // client-side interaction, even though the entity is added to the world
+                            // without error and even with #ensureChunkTicket keeping its chunk
+                            // permanently loaded so it can't be silently discarded afterwards. A real
+                            // player being present at the moment of creation is a genuine
+                            // requirement, not just a proxy for "region is loaded" - so this check
+                            // must stay even though it means the very first player to see a given NPC
+                            // this server run pays the cost of first-time creation (see
+                            // forceResyncForPlayer's javadoc for the separate, smaller join-burst
+                            // packet-volume issue that can cause).
+                            boolean hasViewer = Bukkit.getOnlinePlayers().stream().anyMatch(npc::isShownFor);
+                            if (!hasViewer) {
+                                return;
+                            }
+
                             Entity bukkitEntity = getBukkitEntity(npc);
                             if (bukkitEntity != null) {
                                 ensureTracker(npc, npc.getData().getName(), bukkitEntity);
@@ -576,6 +640,17 @@ public class CustomModelAttribute {
                         try {
                             EntityTracker tracker = getEntityTracker(npc);
                             if (tracker == null || tracker.isClosed() || !CONFIGURED_TRACKERS.contains(tracker)) {
+                                // Same reasoning as reconcileVisibility's own viewer check: only
+                                // (re)create a tracker for this NPC if the joining player should
+                                // actually see it. Without this, every join force-created a tracker
+                                // for every model NPC on the server - including ones nowhere near
+                                // this player, in worlds/regions with no real viewer at all - which
+                                // hits the same "hitbox added but never properly tracked" failure
+                                // this method exists to work around in the first place.
+                                if (!npc.isShownFor(player)) {
+                                    return;
+                                }
+
                                 Entity bukkitEntity = getBukkitEntity(npc);
                                 if (bukkitEntity != null) {
                                     ensureTracker(npc, npc.getData().getName(), bukkitEntity);
@@ -706,6 +781,7 @@ public class CustomModelAttribute {
      */
     public static void closeAllTrackers(Npc npc) {
         LAST_TRACKER_RECREATE_ATTEMPT.remove(npc.getData().getId());
+        releaseChunkTicket(npc);
 
         Entity bukkitEntity = getBukkitEntity(npc);
         if (bukkitEntity == null) {
@@ -722,6 +798,67 @@ public class CustomModelAttribute {
                 tracker.close();
             }
         });
+    }
+
+    /**
+     * Keeps the chunk containing this NPC force-loaded (and therefore actively ticking, on Folia)
+     * for as long as it has a configured tracker, via a plugin chunk ticket.
+     * <p>
+     * BetterModel's hitbox - and the native {@code Interaction} entity it mounts for click
+     * detection - are real, non-persistent NMS entities (explicitly {@code persist = false} in
+     * BetterModel's own {@code HitBoxImpl}), added to the world exactly once, right when
+     * {@link #configureTracker} runs. Nothing else keeps their chunk loaded afterwards: these NPCs
+     * are themselves packet-only fake entities never added to the world (see
+     * {@link #getBukkitEntity}), so unlike a normal entity there's no vanilla mechanism tying the
+     * chunk's lifetime to anything visible. Without a ticket, that chunk is free to unload (or, on
+     * Folia, may never have had a genuinely active/ticking owning region in the first place) the
+     * moment nothing else needs it - which is exactly what happens right after server start, when
+     * trackers get created with zero players anywhere near. Once that happens the hitbox and its
+     * interaction entity are gone for good (non-persistent means they're never saved/reloaded from
+     * disk), while both BetterModel's and this plugin's own bookkeeping still believe the tracker
+     * is fully configured (see {@link #CONFIGURED_TRACKERS}/{@link #hasActiveHitbox}) - the NPC
+     * silently becomes permanently unclickable with no error anywhere. The only previously-known
+     * fix was rebuilding the tracker later while a player happened to be genuinely nearby (e.g.
+     * via {@code /bettermodel reload}). Forcing the chunk to stay loaded from the moment the
+     * hitbox is created removes the failure mode entirely instead of trying to detect/retry it
+     * after the fact.
+     */
+    private static void ensureChunkTicket(Npc npc) {
+        Location location = npc.getData().getLocation();
+        if (location == null || location.getWorld() == null) {
+            return;
+        }
+
+        ChunkTicket ticket = new ChunkTicket(location.getWorld().getName(), location.getBlockX() >> 4, location.getBlockZ() >> 4);
+        ChunkTicket previous = CHUNK_TICKETS.put(npc.getData().getId(), ticket);
+        if (ticket.equals(previous)) {
+            return;
+        }
+        if (previous != null) {
+            releaseChunkTicket(previous);
+        }
+
+        location.getWorld().addPluginChunkTicket(ticket.chunkX(), ticket.chunkZ(), FancyNpcsModelPlugin.get());
+    }
+
+    /**
+     * Releases this NPC's chunk ticket added by {@link #ensureChunkTicket}, if any. Called
+     * whenever this NPC's trackers are closed for good (removal, plugin disable, model reset via
+     * command) - never from the model-switch path in {@link #setModelOnEntityThread}, which closes
+     * the old tracker only to immediately create a new one at the same location.
+     */
+    private static void releaseChunkTicket(Npc npc) {
+        ChunkTicket ticket = CHUNK_TICKETS.remove(npc.getData().getId());
+        if (ticket != null) {
+            releaseChunkTicket(ticket);
+        }
+    }
+
+    private static void releaseChunkTicket(ChunkTicket ticket) {
+        World world = Bukkit.getWorld(ticket.world());
+        if (world != null) {
+            world.removePluginChunkTicket(ticket.chunkX(), ticket.chunkZ(), FancyNpcsModelPlugin.get());
+        }
     }
 
     /**
