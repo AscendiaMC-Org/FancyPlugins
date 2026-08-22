@@ -38,6 +38,7 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 public class CustomModelAttribute {
 
@@ -92,6 +93,13 @@ public class CustomModelAttribute {
 
     private record ChunkTicket(String world, int chunkX, int chunkZ) {
     }
+
+    /**
+     * Reservation clock for staggering first-time tracker creation - see
+     * {@link #reserveFirstTimeCreateDelayMs()}.
+     */
+    private static final AtomicLong LAST_FIRST_TIME_CREATE_MS = new AtomicLong();
+    private static final long FIRST_TIME_CREATE_STAGGER_MS = 150;
 
     /**
      * Called from {@code NpcSpawnEvent} (fired once per player, at the point FancyNpcs is about
@@ -217,6 +225,48 @@ public class CustomModelAttribute {
             return;
         }
 
+        // Creating a brand-new tracker - its hitbox, its native Interaction, and one display
+        // entity per model bone - is heavy enough, packet-wise, that doing it for a dozen-plus
+        // NPCs within the same tick can flood a single client hard enough to disconnect it
+        // outright. That exact burst happens whenever a player logs in and FancyNpcs applies
+        // attributes for every NPC newly visible to them in one pass - confirmed live: "Too many
+        // suspicious packets", plus a client-side entity-data type-mismatch crash from an entity
+        // id being reused too quickly under that load. This must never be fixed by delaying
+        // *whether* a tracker gets created (that already requires a real viewer - see
+        // reconcileVisibility's own javadoc for why that's non-negotiable), only *when* - so this
+        // reserves the next available slot at least FIRST_TIME_CREATE_STAGGER_MS after the last
+        // first-time creation anywhere on the server, spreading a cluster of them out instead of
+        // firing them all in the same tick. An isolated creation (nothing else recent) reserves
+        // slot 0, i.e. still runs immediately - staggering only kicks in once creations are
+        // actually clustered.
+        long delayMs = reserveFirstTimeCreateDelayMs();
+        if (delayMs <= 0) {
+            createTrackerAndDispatch(npc, npcName, modelName, bukkitEntity);
+        } else {
+            Bukkit.getRegionScheduler().runDelayed(FancyNpcsModelPlugin.get(), npc.getData().getLocation(),
+                    task -> createTrackerAndDispatch(npc, npcName, modelName, bukkitEntity),
+                    Math.max(1, delayMs / 50));
+        }
+    }
+
+    /**
+     * Reserves the next available "slot" for a first-time tracker creation - a classic atomic
+     * timestamp-reservation rate limiter. Concurrent/rapid calls get pushed out to at least
+     * {@link #FIRST_TIME_CREATE_STAGGER_MS} apart; an isolated call (nothing reserved recently)
+     * gets a delay of 0 or less, i.e. runs immediately.
+     */
+    private static long reserveFirstTimeCreateDelayMs() {
+        long now = System.currentTimeMillis();
+        long reserved = LAST_FIRST_TIME_CREATE_MS.updateAndGet(prev -> Math.max(now, prev + FIRST_TIME_CREATE_STAGGER_MS));
+        return reserved - now;
+    }
+
+    /**
+     * The actual heavy lifting of creating a brand-new tracker and dispatching its spawn packets -
+     * split out from {@link #setModelOnEntityThread} purely so that call can be staggered (see
+     * {@link #reserveFirstTimeCreateDelayMs()}) without duplicating this logic.
+     */
+    private static void createTrackerAndDispatch(Npc npc, String npcName, String modelName, Entity bukkitEntity) {
         // Gets or creates entity tracker
         EntityTracker tracker = BetterModel.model(modelName)
                 .map(r -> r.getOrCreate(BukkitAdapter.adapt(bukkitEntity)))
