@@ -13,11 +13,13 @@ import kr.toxicity.model.api.bone.BoneTags;
 import kr.toxicity.model.api.bukkit.BetterModelBukkit;
 import kr.toxicity.model.api.bukkit.platform.BukkitAdapter;
 import kr.toxicity.model.api.event.CreateEntityTrackerEvent;
+import kr.toxicity.model.api.event.PluginStartReloadEvent;
 import kr.toxicity.model.api.event.hitbox.HitBoxDamagedEvent;
 import kr.toxicity.model.api.event.hitbox.HitBoxInteractAtEvent;
 import kr.toxicity.model.api.platform.PlatformEntity;
 import kr.toxicity.model.api.tracker.EntityTracker;
 import kr.toxicity.model.api.tracker.EntityTrackerRegistry;
+import kr.toxicity.model.api.tracker.ModelScaler;
 import kr.toxicity.model.api.util.function.BonePredicate;
 import net.kyori.adventure.text.Component;
 import org.bukkit.Bukkit;
@@ -82,6 +84,34 @@ public class CustomModelAttribute {
      */
     private static final Map<String, Long> LAST_TRACKER_RECREATE_ATTEMPT = new ConcurrentHashMap<>();
     private static final long TRACKER_RECREATE_INTERVAL_MS = TimeUnit.SECONDS.toMillis(5);
+
+    /**
+     * Epoch millis of the most recent {@code PluginStartReloadEvent} BetterModel fired (0 if none
+     * seen yet this JVM run). Used by {@link #ensureTracker} to suppress its self-heal for a while
+     * after an admin runs {@code /bettermodel reload} - see that method's own comment for why: the
+     * self-heal and BetterModel's own reload can otherwise both end up creating a tracker for the
+     * same NPC, which is exactly the "the model duplicates and grows every reload" behavior
+     * confirmed live via {@code /bettermodel reload} with FancyLogger DEBUG on - the self-heal
+     * landed inside the gap between BetterModel closing an NPC's old tracker and (asynchronously,
+     * staggered across ticks - see BetterModel's own {@code EntityManager.reload()}) creating its
+     * replacement, saw a closed/unconfigured tracker, and raced its own {@code getOrCreate()}
+     * against BetterModel's still-pending one.
+     */
+    private static volatile long LAST_BETTERMODEL_RELOAD_STARTED_AT = 0L;
+
+    /**
+     * How long after a {@code /bettermodel reload} starts {@link #ensureTracker} holds off its
+     * self-heal entirely. BetterModel staggers its own tracker recreation across ticks per
+     * registry (3 ticks apart per its current implementation) specifically to avoid flooding
+     * clients with packets - on a server with many model NPCs that can legitimately take several
+     * seconds to fully settle, well past BetterModel's own "Reload completed" log line (that one
+     * only covers pack/asset reloading, not the staggered per-entity tracker work queued
+     * afterward). This has to be generous rather than tight: too short and the self-heal jumps in
+     * before BetterModel's own {@code CreateEntityTrackerEvent} has fired for the NPC, recreating
+     * this exact bug; too long only delays how quickly a *genuinely* broken tracker (unrelated to
+     * a reload) gets caught, which is a much smaller cost.
+     */
+    private static final long BETTERMODEL_RELOAD_SUPPRESS_SELF_HEAL_MS = TimeUnit.SECONDS.toMillis(20);
 
     /**
      * The chunk this plugin is currently keeping force-loaded for each NPC (keyed by
@@ -282,11 +312,10 @@ public class CustomModelAttribute {
 
         // Usually already done by the CreateEntityTrackerEvent subscription (see
         // #registerTrackerCreationListener), which fires synchronously inside getOrCreate() above,
-        // before this line even runs. Guarded here too in case that ever isn't true, so this NPC's
-        // tracker is never left without hitbox listeners.
-        if (!CONFIGURED_TRACKERS.contains(tracker)) {
-            configureTracker(npc, tracker);
-        }
+        // before this line even runs. Called unconditionally here too in case that ever isn't true,
+        // so this NPC's tracker is never left without hitbox listeners - configureTracker() claims
+        // the tracker atomically itself (see its javadoc), so it's a safe no-op if already done.
+        configureTracker(npc, tracker);
 
         // The model itself just changed (or was created), so every currently online player needs
         // the new spawn packets - not just whoever's visibility triggered this call. Any player(s)
@@ -375,6 +404,10 @@ public class CustomModelAttribute {
                     );
                     return;
                 }
+                // configureTracker() itself atomically claims the tracker (see its javadoc) before
+                // doing any work, so it's always safe to call unconditionally here even though
+                // this branch can race with the reconcileVisibility/ensureTracker self-heal path
+                // for the same tracker - at most one of them will actually run the method body.
                 if (Bukkit.isOwnedByCurrentRegion(location)) {
                     configureTracker(npc, tracker);
                 } else {
@@ -388,6 +421,16 @@ public class CustomModelAttribute {
                 );
             }
         });
+    }
+
+    /**
+     * Subscribes to BetterModel's own {@code PluginStartReloadEvent}, fired once at the start of
+     * every {@code /bettermodel reload}, purely to record when the most recent one started - see
+     * {@link #LAST_BETTERMODEL_RELOAD_STARTED_AT}'s javadoc for what that's used for and why.
+     */
+    public static void registerReloadListener(FancyNpcsModelPlugin plugin) {
+        BetterModelBukkit.platform().eventBus().subscribe(plugin, PluginStartReloadEvent.class, event ->
+                LAST_BETTERMODEL_RELOAD_STARTED_AT = System.currentTimeMillis());
     }
 
     /**
@@ -426,34 +469,66 @@ public class CustomModelAttribute {
      * tracker some other way (e.g. {@code /bettermodel reload}). With this ordering, a failed
      * attempt leaves the tracker unconfigured, so the very next self-heal pass (within seconds,
      * see {@link #ensureTracker}) closes it and tries again from scratch.
+     * <p>
+     * Claims the tracker atomically as its very first action, via {@code CONFIGURED_TRACKERS.add()}'s
+     * return value - not just a {@code contains()} check beforehand. Both call sites of this method
+     * (this class's {@code CreateEntityTrackerEvent} subscription and {@link #createTrackerAndDispatch})
+     * can independently observe the very same not-yet-configured tracker (most reliably on
+     * {@code /bettermodel reload}, which recreates trackers off-region and forces the subscription
+     * to defer its call onto the region scheduler - see that subscription's own comment) and both
+     * decide to configure it. A plain check-then-call guard at each call site cannot close that race:
+     * "check" and "the whole method body finishing" are not one atomic step. This method must own its
+     * own idempotency instead of trusting callers to. Getting this wrong isn't just double work - the
+     * scale multiply below composes onto whatever scaler is already set rather than resetting it, so a
+     * second run on the same tracker visibly compounds the NPC's size.
      */
     private static void configureTracker(Npc npc, EntityTracker tracker) {
-        // Keep this NPC's chunk force-loaded for as long as it has a tracker - see
-        // #ensureChunkTicket's javadoc for why the hitbox is otherwise not reliably clickable.
-        ensureChunkTicket(npc);
-
-        // Scale
-        if (npc.getData().getScale() != 1) {
-            tracker.scaler(tracker.scaler().multiply(npc.getData().getScale()));
+        if (!CONFIGURED_TRACKERS.add(tracker)) {
+            return;
         }
 
-        // Right click on hitbox
-        tracker.listenHitBox(HitBoxInteractAtEvent.class, event -> {
-            Player player = Bukkit.getPlayer(event.getWho().uuid());
-            if (player == null) return;
+        boolean succeeded = false;
+        try {
+            // Keep this NPC's chunk force-loaded for as long as it has a tracker - see
+            // #ensureChunkTicket's javadoc for why the hitbox is otherwise not reliably clickable.
+            ensureChunkTicket(npc);
 
-            npc.interact(player, ActionTrigger.RIGHT_CLICK);
-        });
+            // Scale
+            //
+            // Set as an absolute value, NOT tracker.scaler().multiply(...): BetterModel's own
+            // /bettermodel reload (EntityTrackerRegistry#reload()) closes every tracker, snapshots
+            // its CURRENT scaler field into a TrackerData (EntityTracker#asTrackerData()), and
+            // hands that same scaler to the brand-new tracker it creates right after
+            // (EntityTrackerRegistry#load() -> TrackerData#applyAs()) - by design, so an admin's
+            // manual /bettermodel scale setting survives a reload. That means the "new" tracker we
+            // get CreateEntityTrackerEvent for here is not starting from a clean baseline - it
+            // already carries whatever scaler we set on its predecessor. Composing another
+            // multiply() on top (the previous approach) stacks a fresh npc-scale factor onto that
+            // carried-over one every single reload, so the model visibly grows without bound the
+            // more often an admin reloads. Setting an absolute value instead is idempotent: no
+            // matter how many times reload hands this same npc scale back to us, the result is
+            // always exactly npc.getData().getScale(), never compounded.
+            if (npc.getData().getScale() != 1) {
+                tracker.scaler(ModelScaler.value(npc.getData().getScale()));
+            }
 
-        // Left click on hitbox
-        tracker.listenHitBox(HitBoxDamagedEvent.class, event -> {
-            PlatformEntity causingEntity = event.getSource().getCausingEntity();
-            if (causingEntity == null) return;
-            Player player = Bukkit.getPlayer(causingEntity.uuid());
-            if (player == null) return;
+            // Right click on hitbox
+            tracker.listenHitBox(HitBoxInteractAtEvent.class, event -> {
+                Player player = Bukkit.getPlayer(event.getWho().uuid());
+                if (player == null) return;
 
-            npc.interact(player, ActionTrigger.LEFT_CLICK);
-        });
+                npc.interact(player, ActionTrigger.RIGHT_CLICK);
+            });
+
+            // Left click on hitbox
+            tracker.listenHitBox(HitBoxDamagedEvent.class, event -> {
+                PlatformEntity causingEntity = event.getSource().getCausingEntity();
+                if (causingEntity == null) return;
+                Player player = Bukkit.getPlayer(causingEntity.uuid());
+                if (player == null) return;
+
+                npc.interact(player, ActionTrigger.LEFT_CLICK);
+            });
 
         // BetterModel also creates this hitbox itself, automatically, shortly after tracker
         // construction - but via a task scheduled through the *entity's own* location
@@ -484,22 +559,32 @@ public class CustomModelAttribute {
         // the named/tagged attempt matches nothing. A model NPC that ends up with a hitbox on every
         // bone instead of one precisely placed one is still fully clickable, which is what matters
         // here; it is not visually different since these hitboxes aren't rendered.
-        boolean createdNamedHitbox = tracker.createHitBox(null, BonePredicate.name("hitbox").or(BonePredicate.tag(BoneTags.HITBOX)).notSet());
-        int hitboxCountAfterNamed = tracker.registry().hitBoxes().size();
-        boolean createdFallbackHitbox = false;
-        if (hitboxCountAfterNamed == 0) {
-            createdFallbackHitbox = tracker.createHitBox(null, BonePredicate.TRUE);
+            boolean createdNamedHitbox = tracker.createHitBox(null, BonePredicate.name("hitbox").or(BonePredicate.tag(BoneTags.HITBOX)).notSet());
+            int hitboxCountAfterNamed = tracker.registry().hitBoxes().size();
+            boolean createdFallbackHitbox = false;
+            if (hitboxCountAfterNamed == 0) {
+                createdFallbackHitbox = tracker.createHitBox(null, BonePredicate.TRUE);
+            }
+
+            tracker.handleCloseEvent((closedTracker, reason) -> CONFIGURED_TRACKERS.remove(closedTracker));
+
+            FancyNpcsModelPlugin.get().getFancyLogger().debug(
+                    "configureTracker completed for npc=" + npc.getData().getName() + " model=" + tracker.name()
+                            + " createdNamedHitbox=" + createdNamedHitbox + " hitboxCountAfterNamed=" + hitboxCountAfterNamed
+                            + " createdFallbackHitbox=" + createdFallbackHitbox
+                            + " finalHitboxCount=" + tracker.registry().hitBoxes().size()
+            );
+
+            succeeded = true;
+        } finally {
+            if (!succeeded) {
+                // Leave the tracker unclaimed so the next self-heal pass (ensureTracker, within
+                // seconds) can retry from scratch - see this method's own javadoc for why marking
+                // it configured must stay reversible on failure, same as before this method owned
+                // its own atomic claim.
+                CONFIGURED_TRACKERS.remove(tracker);
+            }
         }
-
-        CONFIGURED_TRACKERS.add(tracker);
-        tracker.handleCloseEvent((closedTracker, reason) -> CONFIGURED_TRACKERS.remove(closedTracker));
-
-        FancyNpcsModelPlugin.get().getFancyLogger().debug(
-                "configureTracker completed for npc=" + npc.getData().getName() + " model=" + tracker.name()
-                        + " createdNamedHitbox=" + createdNamedHitbox + " hitboxCountAfterNamed=" + hitboxCountAfterNamed
-                        + " createdFallbackHitbox=" + createdFallbackHitbox
-                        + " finalHitboxCount=" + tracker.registry().hitBoxes().size()
-        );
     }
 
     /**
@@ -995,8 +1080,15 @@ public class CustomModelAttribute {
      * second forever.
      */
     private static void ensureTracker(Npc npc, String npcName, Entity bukkitEntity) {
-        String id = npc.getData().getId();
         long now = System.currentTimeMillis();
+
+        if (now - LAST_BETTERMODEL_RELOAD_STARTED_AT < BETTERMODEL_RELOAD_SUPPRESS_SELF_HEAL_MS) {
+            // A /bettermodel reload is still settling - see LAST_BETTERMODEL_RELOAD_STARTED_AT's
+            // javadoc for why jumping in here is exactly what caused trackers to duplicate/grow.
+            return;
+        }
+
+        String id = npc.getData().getId();
         Long last = LAST_TRACKER_RECREATE_ATTEMPT.get(id);
         if (last != null && now - last < TRACKER_RECREATE_INTERVAL_MS) {
             return;

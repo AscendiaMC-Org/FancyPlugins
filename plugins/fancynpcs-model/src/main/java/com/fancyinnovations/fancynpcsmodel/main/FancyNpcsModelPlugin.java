@@ -152,6 +152,7 @@ public class FancyNpcsModelPlugin extends JavaPlugin {
         FancyNpcsPlugin.get().getActionManager().registerAction(new PlayAnimationOnceAction());
         FancyNpcsPlugin.get().getActionManager().registerAction(new PlayAnimationLoopAction());
         CustomModelAttribute.registerTrackerCreationListener(this);
+        CustomModelAttribute.registerReloadListener(this);
 
         // Self-heals model visibility independently of any Bukkit event - see
         // CustomModelAttribute#reconcileVisibility for why this is needed on Folia/CanvasMC.
