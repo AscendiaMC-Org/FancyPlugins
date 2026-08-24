@@ -176,9 +176,18 @@ public class FancyNpcsModelPlugin extends JavaPlugin {
     public void onDisable() {
         fancyLogger.info("Disabling FancyNpcsModel version %s...".formatted(getDescription().getVersion()));
 
-        for (Npc npc : FancyNpcsPlugin.get().getNpcManager().getAllNpcs()) {
-            if (CustomModelAttribute.hasAttribute(npc)) {
-                CustomModelAttribute.closeAllTrackers(npc);
+        // Only close trackers when the plugin is being disabled on its own (e.g. a plugin
+        // reload) - the server keeps running and stale trackers would otherwise linger in the
+        // world. When the whole server is stopping, Folia has already torn its regions down by
+        // the time onDisable runs, so both our own region-scheduler dispatch and BetterModel's
+        // internal one (Tracker#close -> HitBoxImpl#removeHitBox) are guaranteed to fail - and
+        // there's nothing to clean up anyway, since every entity is about to be destroyed with
+        // the server itself.
+        if (!Bukkit.isStopping()) {
+            for (Npc npc : FancyNpcsPlugin.get().getNpcManager().getAllNpcs()) {
+                if (CustomModelAttribute.hasAttribute(npc)) {
+                    CustomModelAttribute.closeAllTrackers(npc);
+                }
             }
         }
 

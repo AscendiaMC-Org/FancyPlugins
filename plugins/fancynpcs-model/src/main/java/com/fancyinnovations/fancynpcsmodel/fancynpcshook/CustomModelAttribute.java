@@ -828,6 +828,13 @@ public class CustomModelAttribute {
      * Callers (e.g. commands) may run on the main thread or any other thread, not necessarily the
      * entity's own Folia region thread - dispatch through the region scheduler for the same reason
      * {@link #setModel(Npc, String)} does.
+     * <p>
+     * Exception: while the plugin is disabled (i.e. during {@code onDisable}), the region scheduler
+     * refuses to accept new tasks at all - Bukkit flips {@code isEnabled} to false before calling
+     * {@code onDisable}, and Folia enforces that no plugin may schedule anything once disabled,
+     * throwing {@link org.bukkit.plugin.IllegalPluginAccessException}. In that case close directly
+     * on the calling thread instead of dispatching, since by then all regions are shutting down
+     * anyway.
      */
     public static void closeAllTrackers(Npc npc) {
         LAST_TRACKER_RECREATE_ATTEMPT.remove(npc.getData().getId());
@@ -835,6 +842,11 @@ public class CustomModelAttribute {
 
         Entity bukkitEntity = getBukkitEntity(npc);
         if (bukkitEntity == null) {
+            return;
+        }
+
+        if (!FancyNpcsModelPlugin.get().isEnabled()) {
+            closeAllTrackers(bukkitEntity);
             return;
         }
 
