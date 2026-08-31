@@ -132,6 +132,41 @@ public class CustomModelAttribute {
     private static final long FIRST_TIME_CREATE_STAGGER_MS = 150;
 
     /**
+     * Stagger, per NPC, applied only to {@link #reconcileVisibility}'s resend of an
+     * already-configured tracker - see that method's javadoc for why only that branch is
+     * staggered, not tracker (re)creation.
+     */
+    private static final long RECONCILE_STAGGER_MS = 100;
+
+    /**
+     * Minimum delay enforced between {@link #closeAllTrackers(Entity)} and the matching
+     * {@link #createTrackerAndDispatch}, on every model switch - not just clustered ones (see
+     * {@link #reserveFirstTimeCreateDelayMs()}, which only staggers a *burst* of first-time
+     * creations and otherwise returns 0/immediate).
+     * <p>
+     * BetterModel's own {@code EntityTrackerRegistry#reload()} closes a tracker's displays (which
+     * sends the client remove-entity packets) and only then spawns their replacements, one tick
+     * later - its own source documents exactly why: calling the replacement's spawn/metadata
+     * synchronously right after close() can let a client process the new display's entity-data
+     * before it has finished tearing down the old one, which throws {@code
+     * IllegalStateException: Invalid entity data item type for field N} and disconnects the
+     * player - a stale {@code SynchedEntityData} accessor from the entity that was just removed
+     * still occupying that slot when the new entity's data arrives for it.
+     * <p>
+     * {@link #closeAllTrackers(Entity)} immediately followed by an *unstaggered*
+     * {@link #createTrackerAndDispatch} (the {@code delayMs <= 0} branch below, which is the
+     * common case - an isolated model switch, not a join burst) reproduces that exact race: this
+     * plugin calls {@code tracker.close()} directly and creates the replacement tracker right
+     * after, in the same tick, bypassing the one-tick gap BetterModel's own reload() now enforces
+     * internally for itself. Confirmed live: the exact "Invalid entity data item type" disconnect
+     * still occurred here even after BetterModel's own fix shipped, specifically from this
+     * plugin's own close+recreate path, not BetterModel's. Enforcing the same one-tick minimum
+     * here - always, not just when clustered - closes that gap at its actual source instead of
+     * relying on a packet filter downstream.
+     */
+    private static final long MIN_CLOSE_TO_CREATE_DELAY_MS = 50;
+
+    /**
      * Called from {@code NpcSpawnEvent} (fired once per player, at the point FancyNpcs is about
      * to (re)send that player their view of the NPC). Only records the player - the actual
      * spawn-packet dispatch happens later from {@link #setModelOnEntityThread}, on FancyNpcs'
@@ -269,14 +304,14 @@ public class CustomModelAttribute {
         // firing them all in the same tick. An isolated creation (nothing else recent) reserves
         // slot 0, i.e. still runs immediately - staggering only kicks in once creations are
         // actually clustered.
-        long delayMs = reserveFirstTimeCreateDelayMs();
-        if (delayMs <= 0) {
-            createTrackerAndDispatch(npc, npcName, modelName, bukkitEntity);
-        } else {
-            Bukkit.getRegionScheduler().runDelayed(FancyNpcsModelPlugin.get(), npc.getData().getLocation(),
-                    task -> createTrackerAndDispatch(npc, npcName, modelName, bukkitEntity),
-                    Math.max(1, delayMs / 50));
-        }
+        // See MIN_CLOSE_TO_CREATE_DELAY_MS's javadoc: always wait at least one tick after
+        // closeAllTrackers() above before spawning the replacement, even for an isolated,
+        // non-clustered switch - reserveFirstTimeCreateDelayMs() alone returns 0 for that case,
+        // which is exactly the close()-then-load()-in-the-same-tick race that crashes clients.
+        long delayMs = Math.max(reserveFirstTimeCreateDelayMs(), MIN_CLOSE_TO_CREATE_DELAY_MS);
+        Bukkit.getRegionScheduler().runDelayed(FancyNpcsModelPlugin.get(), npc.getData().getLocation(),
+                task -> createTrackerAndDispatch(npc, npcName, modelName, bukkitEntity),
+                Math.max(1, delayMs / 50));
     }
 
     /**
@@ -673,6 +708,26 @@ public class CustomModelAttribute {
      * that gap the same way FancyNpcs' own tracker closes it for the base NPC.
      */
     public static void reconcileVisibility() {
+        // This fires every second (see FancyNpcsModelPlugin#onEnable). Dispatching every NPC's
+        // *resend for an already-configured tracker* in the same instant - as this used to do -
+        // reproduces exactly the "dozen-plus NPCs within the same tick" packet burst documented on
+        // createTrackerAndDispatch/setModelOnEntityThread: on a server with enough model NPCs, any
+        // event that desyncs several of them at once (a Nexo reload resetting visibility
+        // bookkeeping is the one confirmed live) makes the very next reconcile tick blast all of
+        // their resends together, which is what actually triggers the client packet flood and the
+        // entity-data type-mismatch crash - not the event itself.
+        //
+        // The *missing-tracker* branch below (ensureTracker) is deliberately left dispatched
+        // immediately, exactly as before - staggering that too (an earlier version of this fix
+        // did) delays a joining player's very first sight of the NPC on top of the staggering
+        // setModelOnEntityThread's own reserveFirstTimeCreateDelayMs already does for first-time
+        // creation, and once compounded with ensureTracker's own 5s per-NPC retry cooldown, a
+        // burst of joins could end up with a model that only ever got created by an unrelated
+        // external event (e.g. a later /nexo reload re-triggering BetterModel's own
+        // CreateEntityTrackerEvent) instead of on its own - confirmed live. Only the resend path
+        // for trackers that already exist needs staggering; that's the one whose volume actually
+        // scales with "how many NPCs just got globally desynced at once".
+        int index = 0;
         for (Npc npc : FancyNpcsPlugin.get().getNpcManager().getAllNpcs()) {
             // This runs unattended on a timer, forever - a single bad NPC (no location, mid-removal,
             // whatever) throwing here must never be allowed to propagate: Bukkit.getAsyncScheduler()
@@ -684,6 +739,7 @@ public class CustomModelAttribute {
             try {
                 if (!hasAttribute(npc) || npc.getData().getLocation() == null) continue;
 
+                long resendDelayMs = RECONCILE_STAGGER_MS * index++;
                 Bukkit.getRegionScheduler().run(FancyNpcsModelPlugin.get(), npc.getData().getLocation(), task -> {
                     try {
                         EntityTracker tracker = getEntityTracker(npc);
@@ -715,8 +771,23 @@ public class CustomModelAttribute {
                         }
 
                         EntityTrackerRegistry registry = tracker.registry();
-                        for (Player player : Bukkit.getOnlinePlayers()) {
-                            syncModelForPlayer(registry, npc, player, false);
+                        Runnable resend = () -> {
+                            try {
+                                for (Player player : Bukkit.getOnlinePlayers()) {
+                                    syncModelForPlayer(registry, npc, player, false);
+                                }
+                            } catch (Throwable t) {
+                                FancyNpcsModelPlugin.get().getFancyLogger().error(
+                                        "Failed to reconcile model visibility for npc " + npc.getData().getName(),
+                                        ThrowableProperty.of(t)
+                                );
+                            }
+                        };
+                        if (resendDelayMs <= 0) {
+                            resend.run();
+                        } else {
+                            Bukkit.getAsyncScheduler().runDelayed(FancyNpcsModelPlugin.get(),
+                                    (delayedTask) -> resend.run(), resendDelayMs, TimeUnit.MILLISECONDS);
                         }
                     } catch (Throwable t) {
                         FancyNpcsModelPlugin.get().getFancyLogger().error(
